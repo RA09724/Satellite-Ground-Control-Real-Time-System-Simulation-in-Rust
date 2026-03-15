@@ -1,0 +1,34 @@
+# =============================================================================
+# .gitignore — Satellite OCS (RTS_IA_TP071496)
+# =============================================================================
+
+# Rust build output — never commit these
+/target/
+
+# Cargo lock file for libraries (keep for binaries)
+# We KEEP Cargo.lock since this is a binary project — it ensures
+# reproducible builds on every machine.
+# DO NOT add Cargo.lock here.
+
+# Simulation output files — generated at runtime, not source
+fault_log.txt
+downlink_log.txt
+
+# Windows-specific
+Thumbs.db
+Desktop.ini
+
+# VS Code settings (optional — remove the # if you want to exclude these)
+# .vscode/
+
+# IntelliJ / CLion
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Environment / secrets — never commit
+.env
+*.key
+*.pem

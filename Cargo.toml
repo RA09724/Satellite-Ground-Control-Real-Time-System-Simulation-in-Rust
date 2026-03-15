@@ -1,0 +1,19 @@
+[package]
+name    = "RTS_IA_TP071496"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime for TCP/UDP networking (Task 3)
+tokio  = { version = "1", features = ["full"] }
+# Serialisation — packets are sent as JSON over the wire
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "timeapi", "winbase"] }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
