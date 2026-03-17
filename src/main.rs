@@ -10,12 +10,13 @@
 mod types;
 mod buffer;
 mod metrics;
+mod logger;
 mod a1_sensor;
 mod a2_scheduler;
 mod a3_downlink;
 mod a4_benchmark;
 
-use std::sync::atomic::{AtomicBool};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,7 +33,7 @@ use winapi::um::timeapi::{timeBeginPeriod, timeEndPeriod};
 // Configuration
 // ---------------------------------------------------------------------------
 
-const SIM_DURATION_SECS: u64   = 10;
+const SIM_DURATION_SECS: u64   = 300; // 5 minutes
 const BUFFER_CAPACITY:   usize = 32;
 
 // ---------------------------------------------------------------------------
@@ -52,10 +53,9 @@ fn main() {
     println!("║             HealthMon   | AntennaAlign               ║");
     println!("║  Downlink : TCP :9000 (telemetry)                    ║");
     println!("║             UDP :9001 → :9002 (alerts/status)        ║");
-    println!("║  Faults   : injected every {}s | limit {}ms          ║",
-        a4_benchmark::FAULT_LOG_PATH.len(), 200); // placeholder widths
+    println!("║  Faults   : injected every 60s | limit 200ms         ║");
     println!("║  Buffer   : capacity = {}                            ║", BUFFER_CAPACITY);
-    println!("║  Duration : {} seconds                                ║", SIM_DURATION_SECS);
+    println!("║  Duration : {} seconds                               ║", SIM_DURATION_SECS);
     println!("╚══════════════════════════════════════════════════════╝\n");
 
     let epoch        = Instant::now();
@@ -64,32 +64,48 @@ fn main() {
     let stop         = Arc::new(AtomicBool::new(false));
     let run_duration = Duration::from_secs(SIM_DURATION_SECS);
 
+    // ── Performance logger — shared across all tasks ──────────────────────
+    // Creates performance_log.txt and writes per-cycle drift, latency and
+    // jitter for every sensor, scheduler task, downlink packet and fault event.
+    let logger = logger::Logger::new();
+
     // Ctrl-C stub.
     { let s = stop.clone(); thread::spawn(move || { let _ = s; }); }
 
     // ── Task 4: Fault injector ────────────────────────────────────────────
-    // Must start before sensors so faults are ready to fire from t=0.
     let (fault_handle, fault_state) =
-        a4_benchmark::spawn_fault_injector(stop.clone(), run_duration);
+        a4_benchmark::spawn_fault_injector(
+            stop.clone(),
+            run_duration,
+            logger.clone(),
+        );
 
     // ── Task 3: Downlink (TCP + UDP) ──────────────────────────────────────
     let (downlink_handle, downlink_state) = a3_downlink::spawn_downlink_task(
-        buffer.clone(), stop.clone(), run_duration,
+        buffer.clone(),
+        stop.clone(),
+        run_duration,
+        logger.clone(),
     );
 
-    // ── Task 1: Sensor acquisition (with fault hooks) ─────────────────────
+    // ── Task 1: Sensor acquisition (with fault hooks + logger) ────────────
     let sensor_handles = a1_sensor::spawn_sensor_threads(
         buffer.clone(),
         metrics.clone(),
         epoch,
         run_duration,
         stop.clone(),
-        Some(fault_state.clone()),  // pass fault state to sensors
+        Some(fault_state.clone()),
+        logger.clone(),
     );
 
-    // ── Task 2: Scheduler threads ─────────────────────────────────────────
+    // ── Task 2: Scheduler threads (with logger) ───────────────────────────
     let (sched_handles, violation_log, job_log, cpu_nanos) =
-        a2_scheduler::spawn_scheduler_threads(stop.clone(), run_duration);
+        a2_scheduler::spawn_scheduler_threads(
+            stop.clone(),
+            run_duration,
+            logger.clone(),
+        );
 
     // ── Wait for sensor threads ───────────────────────────────────────────
     let mut all_alerts = Vec::new();
@@ -144,7 +160,7 @@ fn main() {
     // ── Task 3 report ─────────────────────────────────────────────────────
     a3_downlink::print_downlink_report(&downlink_state, run_duration);
 
-    // ── Task 4 report — full benchmark with fault analysis ────────────────
+    // ── Task 4 report ─────────────────────────────────────────────────────
     a4_benchmark::print_benchmark_report(
         &fault_state,
         &metrics,
@@ -154,10 +170,25 @@ fn main() {
         run_duration,
     );
 
+    // ── Write final performance log report ────────────────────────────────
+    // Appends the structured summary to performance_log.txt covering all
+    // six sections: drift, pipeline latency, jitter, deadline adherence,
+    // CPU utilisation, and system verdict.
+    logger.write_final_report(
+        &metrics,
+        &job_log,
+        &violation_log,
+        &cpu_nanos,
+        &downlink_state,
+        &fault_state,
+        run_duration,
+    );
+
     println!("\n[MAIN] Simulation complete.");
-    println!("[MAIN] Student B GCS: TCP {}  |  UDP {}",
+    println!("[MAIN] Student B GCS : TCP {}  |  UDP {}",
         a3_downlink::TCP_ADDR, a3_downlink::GCS_UDP);
-    println!("[MAIN] Fault log: {}", a4_benchmark::FAULT_LOG_PATH);
+    println!("[MAIN] Fault log     : {}", a4_benchmark::FAULT_LOG_PATH);
+    println!("[MAIN] Performance log: {}", logger::LOG_PATH);
 
     #[cfg(windows)]
     unsafe { timeEndPeriod(1); }

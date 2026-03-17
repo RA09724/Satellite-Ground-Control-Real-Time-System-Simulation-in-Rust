@@ -3,15 +3,21 @@ name    = "RTS_IA_TP071496"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "RTS_IA_TP071496"
+path = "src/main.rs"
+
+[[bin]]
+name = "gcs_mock"
+path = "src/gcs_mock.rs"
+
 [dependencies]
-# Async runtime for TCP/UDP networking (Task 3)
-tokio  = { version = "1", features = ["full"] }
-# Serialisation — packets are sent as JSON over the wire
+tokio      = { version = "1", features = ["full"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "timeapi", "winbase"] }
+winapi = { version = "0.3", features = ["processthreadsapi", "timeapi", "winbase", "consoleapi", "processenv"] }
 
 [profile.release]
 opt-level     = 3

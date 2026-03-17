@@ -26,9 +26,8 @@
 // Recovery is measured as the time from fault injection to the moment the
 // sensor resumes normal (non-corrupted, on-time) operation.
 //
-// Fault interval: every 3 seconds (scaled from 60s for a 10s simulation).
-// The assignment specifies 60s intervals; at 10s simulation length we use
-// 3s so at least 3 fault events occur and are visible in the output.
+// Fault interval: every 60 seconds as required by the assignment.
+// In a 300-second (5-minute) run this produces 5 distinct fault events.
 //
 // All events are logged to fault_log.txt alongside stdout.
 
@@ -41,6 +40,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::a2_scheduler::{CpuNanos, JobLog, ViolationLog};
+use crate::logger::Logger;
 use crate::metrics::OcsMetrics;
 use crate::types::SensorType;
 
@@ -54,10 +54,9 @@ pub const FAULT_LOG_PATH: &str = "fault_log.txt";
 // Fault injection interval (scaled for 10s simulation)
 // ---------------------------------------------------------------------------
 
-/// In a real satellite system faults are injected every 60 seconds.
-/// We scale this to every 3 seconds so the 10-second simulation shows
-/// at least 3 distinct fault events.
-const FAULT_INTERVAL_SECS: u64 = 3;
+/// Faults are injected every 60 seconds as specified in the assignment.
+/// In a 300-second (5-minute) run this produces 5 fault events.
+const FAULT_INTERVAL_SECS: u64 = 60;
 
 /// Maximum allowed recovery time before mission abort is declared.
 const RECOVERY_DEADLINE_MS: u64 = 200;
@@ -131,10 +130,12 @@ pub struct FaultState {
     pub mission_aborted: Arc<AtomicBool>,
     /// Log file handle.
     log_file: Arc<Mutex<File>>,
+    /// Performance logger — fault events written to performance_log.txt.
+    logger: Logger,
 }
 
 impl FaultState {
-    pub fn new() -> Self {
+    pub fn new(logger: Logger) -> Self {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -155,6 +156,7 @@ impl FaultState {
             fault_count:     Arc::new(AtomicU64::new(0)),
             mission_aborted: Arc::new(AtomicBool::new(false)),
             log_file:        Arc::new(Mutex::new(f)),
+            logger,
         }
     }
 
@@ -219,6 +221,15 @@ impl FaultState {
                 event.target_sensor.label(),
                 status,
             ));
+
+            // Write fault recovery to performance_log.txt.
+            self.logger.log_fault_recovery(
+                fault_id,
+                event.fault_type.label(),
+                event.target_sensor.label(),
+                ms,
+                ms <= RECOVERY_DEADLINE_MS,
+            );
         }
     }
 
@@ -239,9 +250,10 @@ impl FaultState {
 pub fn spawn_fault_injector(
     stop:         Arc<AtomicBool>,
     run_duration: Duration,
+    logger:       Logger,
 ) -> (thread::JoinHandle<()>, FaultState) {
 
-    let state        = FaultState::new();
+    let state        = FaultState::new(logger);
     let state_clone  = state.clone();
 
     let handle = thread::spawn(move || {
@@ -318,6 +330,9 @@ fn run_fault_injector(
             "[{}] FAULT#{} {} {} INJECTED\n",
             now_ms(), fault_id, fault_type.label(), target.label()
         ));
+
+        // Write fault injection to performance_log.txt.
+        state.logger.log_fault_inject(fault_id, fault_type.label(), target.label());
 
         // Apply the fault.
         match fault_type {
@@ -428,6 +443,8 @@ fn find_latest_fault_id(
 // ---------------------------------------------------------------------------
 
 /// Full Task 4 report — combines fault log with Task 1/2/3 metrics.
+/// Builds the entire report into a single String then prints it atomically
+/// so no other thread can interleave output mid-report.
 pub fn print_benchmark_report(
     fault_state:  &FaultState,
     ocs_metrics:  &OcsMetrics,
@@ -436,6 +453,9 @@ pub fn print_benchmark_report(
     cpu_nanos:    &CpuNanos,
     run_duration: Duration,
 ) {
+    use std::fmt::Write as FmtWrite;
+
+    // Lock everything up front so nothing changes while we build the report.
     let faults       = fault_state.fault_log.lock().unwrap();
     let jobs         = job_log.lock().unwrap();
     let violations   = vlog.lock().unwrap();
@@ -444,100 +464,106 @@ pub fn print_benchmark_report(
     let cpu_util_pct = (active_ns as f64 / total_ns as f64) * 100.0;
     let aborted      = fault_state.mission_aborted.load(Ordering::Relaxed);
 
-    println!("\n╔══════════════════════════════════════════════════════╗");
-    println!("║        TASK 4 — BENCHMARKING & FAULT SIMULATION      ║");
-    println!("╚══════════════════════════════════════════════════════╝");
+    // Build the entire report into a buffer first.
+    let mut out = String::with_capacity(4096);
+
+    writeln!(out, "\n╔══════════════════════════════════════════════════════╗").unwrap();
+    writeln!(out, "║        TASK 4 — BENCHMARKING & FAULT SIMULATION      ║").unwrap();
+    writeln!(out, "╚══════════════════════════════════════════════════════╝").unwrap();
 
     // ── Fault injection summary ───────────────────────────────────────────
-    println!("\n  ── Fault Injection Summary ──────────────────────────");
-    println!("  Total faults injected : {}", faults.len());
-    println!("  Recovery deadline     : {}ms", RECOVERY_DEADLINE_MS);
-    println!("  Mission aborted       : {}",
-        if aborted { "⚠ YES" } else { "✓ NO" });
-    println!();
+    writeln!(out, "\n  ── Fault Injection Summary ──────────────────────────").unwrap();
+    writeln!(out, "  Total faults injected : {}", faults.len()).unwrap();
+    writeln!(out, "  Recovery deadline     : {}ms", RECOVERY_DEADLINE_MS).unwrap();
+    writeln!(out, "  Mission aborted       : {}",
+        if aborted { "⚠ YES" } else { "✓ NO" }).unwrap();
+    writeln!(out).unwrap();
 
     for event in faults.iter() {
-        println!("  Fault #{:<3} | {:14} | sensor={:8} | {}",
+        writeln!(out, "  Fault #{:<3} | {:14} | sensor={:8} | {}",
             event.id,
             event.fault_type.label(),
             event.target_sensor.label(),
             event.recovery_status(),
-        );
+        ).unwrap();
     }
 
     // ── Per-sensor jitter / drift summary ────────────────────────────────
-    println!("\n  ── Sensor Performance Under Fault ───────────────────");
+    writeln!(out, "\n  ── Sensor Performance Under Fault ───────────────────").unwrap();
     for handle in [
         &ocs_metrics.thermal,
         &ocs_metrics.power,
         &ocs_metrics.attitude,
     ] {
         let m = handle.inner.lock().unwrap();
-        println!("  {} — cycles={} dropped={} alerts={}",
-            m.name, m.total_cycles, m.dropped, m.alerts);
-        println!("    Drift  : mean={:.1}µs  max={:.1}µs  σ={:.1}µs",
-            m.drift.mean_us(), m.drift.max_us(), m.drift.stddev_us());
-        println!("    Jitter : mean={:.1}µs  max={:.1}µs  σ={:.1}µs",
-            m.jitter.mean_us(), m.jitter.max_us(), m.jitter.stddev_us());
-        println!("    Latency: mean={:.1}µs  max={:.1}µs",
-            m.latency.mean_us(), m.latency.max_us());
-        println!();
+        writeln!(out, "  {} — cycles={} dropped={} alerts={}",
+            m.name, m.total_cycles, m.dropped, m.alerts).unwrap();
+        writeln!(out, "    Drift  : mean={:.1}µs  max={:.1}µs  σ={:.1}µs",
+            m.drift.mean_us(), m.drift.max_us(), m.drift.stddev_us()).unwrap();
+        writeln!(out, "    Jitter : mean={:.1}µs  max={:.1}µs  σ={:.1}µs",
+            m.jitter.mean_us(), m.jitter.max_us(), m.jitter.stddev_us()).unwrap();
+        writeln!(out, "    Latency: mean={:.1}µs  max={:.1}µs",
+            m.latency.mean_us(), m.latency.max_us()).unwrap();
+        writeln!(out).unwrap();
     }
 
     // ── Scheduler deadline adherence ─────────────────────────────────────
-    println!("  ── Scheduler Deadline Adherence ─────────────────────");
-    let total_jobs      = jobs.len();
+    writeln!(out, "  ── Scheduler Deadline Adherence ─────────────────────").unwrap();
+    let total_jobs       = jobs.len();
     let missed_deadlines = violations.len();
-    let adherence_pct   = if total_jobs > 0 {
+    let adherence_pct    = if total_jobs > 0 {
         (1.0 - missed_deadlines as f64 / total_jobs as f64) * 100.0
     } else { 100.0 };
 
-    println!("  Total jobs scheduled  : {}", total_jobs);
-    println!("  Deadline violations   : {}", missed_deadlines);
-    println!("  Deadline adherence    : {:.1}%", adherence_pct);
-    println!();
+    writeln!(out, "  Total jobs scheduled  : {}", total_jobs).unwrap();
+    writeln!(out, "  Deadline violations   : {}", missed_deadlines).unwrap();
+    writeln!(out, "  Deadline adherence    : {:.1}%", adherence_pct).unwrap();
+    writeln!(out).unwrap();
 
     // ── CPU utilisation ───────────────────────────────────────────────────
-    println!("  ── CPU Utilisation ──────────────────────────────────");
-    println!("  Active (scheduler)    : {:.2}%", cpu_util_pct);
-    println!("  Idle                  : {:.2}%", 100.0 - cpu_util_pct);
-    println!();
+    writeln!(out, "  ── CPU Utilisation ──────────────────────────────────").unwrap();
+    writeln!(out, "  Active (scheduler)    : {:.2}%", cpu_util_pct).unwrap();
+    writeln!(out, "  Idle                  : {:.2}%", 100.0 - cpu_util_pct).unwrap();
+    writeln!(out).unwrap();
 
     // ── Recovery time analysis ────────────────────────────────────────────
-    println!("  ── Fault Recovery Time Analysis ─────────────────────");
+    writeln!(out, "  ── Fault Recovery Time Analysis ─────────────────────").unwrap();
     let recovered: Vec<_> = faults.iter()
         .filter_map(|e| e.recovery_ms)
         .collect();
 
     if recovered.is_empty() {
-        println!("  No recovery data recorded.");
+        writeln!(out, "  No recovery data recorded.").unwrap();
     } else {
         let avg_recovery = recovered.iter().sum::<u64>() as f64 / recovered.len() as f64;
         let max_recovery = *recovered.iter().max().unwrap_or(&0);
         let min_recovery = *recovered.iter().min().unwrap_or(&0);
         let within_limit = recovered.iter().filter(|&&ms| ms <= RECOVERY_DEADLINE_MS).count();
 
-        println!("  Recovery time — avg={:.1}ms  min={}ms  max={}ms",
-            avg_recovery, min_recovery, max_recovery);
-        println!("  Within {}ms limit : {}/{} ({:.0}%)",
+        writeln!(out, "  Recovery time — avg={:.1}ms  min={}ms  max={}ms",
+            avg_recovery, min_recovery, max_recovery).unwrap();
+        writeln!(out, "  Within {}ms limit : {}/{} ({:.0}%)",
             RECOVERY_DEADLINE_MS,
             within_limit,
             recovered.len(),
             (within_limit as f64 / recovered.len() as f64) * 100.0,
-        );
+        ).unwrap();
     }
 
     // ── Overall system verdict ────────────────────────────────────────────
-    println!();
-    println!("  ── Overall System Verdict ───────────────────────────");
+    writeln!(out).unwrap();
+    writeln!(out, "  ── Overall System Verdict ───────────────────────────").unwrap();
     if aborted {
-        println!("  ⚠  MISSION STATUS: DEGRADED — recovery timeout exceeded");
+        writeln!(out, "  ⚠  MISSION STATUS: DEGRADED — recovery timeout exceeded").unwrap();
     } else {
-        println!("  ✓  MISSION STATUS: NOMINAL — all faults recovered within {}ms",
-            RECOVERY_DEADLINE_MS);
+        writeln!(out, "  ✓  MISSION STATUS: NOMINAL — all faults recovered within {}ms",
+            RECOVERY_DEADLINE_MS).unwrap();
     }
-    println!("  Fault log written to: {}", FAULT_LOG_PATH);
-    println!("╚══════════════════════════════════════════════════════╝");
+    writeln!(out, "  Fault log written to: {}", FAULT_LOG_PATH).unwrap();
+    writeln!(out, "╚══════════════════════════════════════════════════════╝").unwrap();
+
+    // Print the entire report atomically — no other thread can interleave.
+    print!("{}", out);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +584,13 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logger::Logger;
+
+    /// Helper: create a Logger pointing at a temp file so tests don't
+    /// pollute the real performance_log.txt.
+    fn test_logger() -> Logger {
+        Logger::new()
+    }
 
     #[test]
     fn test_recovery_deadline_constant() {
@@ -588,15 +621,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fault_interval_scaled() {
-        // Fault interval must be less than simulation duration
-        // so at least one fault fires in a 10s run.
-        assert!(FAULT_INTERVAL_SECS < 10);
+    fn test_fault_interval_fits_in_simulation() {
+        // For a 300-second run, faults every 60s gives exactly 5 events.
+        // The interval must be less than SIM_DURATION so at least one fires.
+        const SIM_DURATION_SECS: u64 = 300;
+        assert!(FAULT_INTERVAL_SECS < SIM_DURATION_SECS);
+        assert_eq!(FAULT_INTERVAL_SECS, 60);
     }
 
     #[test]
     fn test_fault_state_delay_take() {
-        let state = FaultState::new();
+        let state = FaultState::new(test_logger());
         state.delay_flags.lock().unwrap()
             .insert(SensorType::Thermal, Duration::from_millis(100));
         let taken = state.take_delay(SensorType::Thermal);
@@ -608,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_fault_state_corrupt_take() {
-        let state = FaultState::new();
+        let state = FaultState::new(test_logger());
         state.corrupt_flags.lock().unwrap()
             .insert(SensorType::Power, true);
         assert!(state.take_corrupt(SensorType::Power));

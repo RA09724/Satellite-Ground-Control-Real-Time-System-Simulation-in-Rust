@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::a4_benchmark::{self, FaultState};
 use crate::buffer::SensorBuffer;
+use crate::logger::Logger;
 use crate::metrics::OcsMetrics;
 use crate::types::{SafetyAlert, SensorReading, SensorType};
 
@@ -78,6 +79,7 @@ pub fn spawn_sensor_threads(
     run_duration: Duration,
     stop:         Arc<AtomicBool>,
     fault_state:  Option<FaultState>,
+    logger:       Logger,
 ) -> Vec<thread::JoinHandle<Vec<SafetyAlert>>> {
 
     let assignments: &[(SensorType, usize)] = &[
@@ -93,12 +95,13 @@ pub fn spawn_sensor_threads(
             let met      = metrics.clone();
             let stp      = stop.clone();
             let fs       = fault_state.clone();
+            let log      = logger.clone();
             let deadline = Instant::now() + run_duration;
 
             thread::spawn(move || {
                 set_realtime_priority();
                 pin_to_core(core);
-                run_sensor(sensor, buf, met, epoch, deadline, stp, fs)
+                run_sensor(sensor, buf, met, epoch, deadline, stp, fs, log)
             })
         })
         .collect()
@@ -116,6 +119,7 @@ fn run_sensor(
     deadline:    Instant,
     stop:        Arc<AtomicBool>,
     fault_state: Option<FaultState>,
+    logger:      Logger,
 ) -> Vec<SafetyAlert> {
 
     let period        = sensor.period();
@@ -126,6 +130,7 @@ fn run_sensor(
     let mut consecutive_miss: u32 = 0;
     let mut alerts:           Vec<SafetyAlert> = Vec::new();
     let mut next_scheduled    = Instant::now();
+    let mut last_read_us:     Option<u64> = None;
 
     println!(
         "[SENSOR][INIT] {} | period={:?} | priority={}",
@@ -199,6 +204,21 @@ fn run_sensor(
         let accepted       = buffer.push(reading, read_done);
         let insert_latency = Instant::now().duration_since(read_done);
         let read_epoch_us  = read_done.duration_since(epoch).as_micros() as u64;
+
+        // ── Log drift, latency, and jitter to performance_log.txt ─────────
+        logger.log_sensor_drift(sensor.label(), cycle, drift_us);
+        logger.log_sensor_latency(
+            sensor.label(), cycle,
+            insert_latency.as_micros() as f64,
+        );
+        // Jitter = deviation from ideal period between successive reads.
+        if let Some(prev_us) = last_read_us {
+            let ideal_us   = period.as_micros() as f64;
+            let actual_us  = read_epoch_us.saturating_sub(prev_us) as f64;
+            let jitter_us  = (actual_us - ideal_us).abs();
+            logger.log_sensor_jitter(sensor.label(), cycle, jitter_us);
+        }
+        last_read_us = Some(read_epoch_us);
 
         handle.record_cycle(drift_us, insert_latency, read_epoch_us);
 

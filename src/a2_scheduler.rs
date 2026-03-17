@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::logger::Logger;
+
 // ---------------------------------------------------------------------------
 // Task identity
 // ---------------------------------------------------------------------------
@@ -194,6 +196,7 @@ fn pin_to_core(core: usize) {
 pub fn spawn_scheduler_threads(
     stop:         Arc<AtomicBool>,
     run_duration: Duration,
+    logger:       Logger,
 ) -> (Vec<thread::JoinHandle<()>>, ViolationLog, JobLog, CpuNanos) {
 
     let preempt_flag  : PreemptFlag  = Arc::new(AtomicBool::new(false));
@@ -214,12 +217,13 @@ pub fn spawn_scheduler_threads(
         let vlog         = violation_log.clone();
         let jlog         = job_log.clone();
         let cpu          = cpu_nanos.clone();
+        let log          = logger.clone();
         let deadline_end = Instant::now() + run_duration;
 
         thread::spawn(move || {
             set_task_priority(task);
             pin_to_core(task.cpu_core());
-            run_task(task, stp, pf, vlog, jlog, cpu, deadline_end);
+            run_task(task, stp, pf, vlog, jlog, cpu, deadline_end, log);
         })
     }).collect();
 
@@ -238,6 +242,7 @@ fn run_task(
     jlog:         JobLog,
     cpu_nanos:    CpuNanos,
     deadline_end: Instant,
+    logger:       Logger,
 ) {
     let period     = task.period();
     let wcet       = task.wcet();
@@ -269,6 +274,9 @@ fn run_task(
             .saturating_duration_since(released_at)
             .as_micros() as u64;
 
+        // Log scheduling drift for every job.
+        logger.log_sched_drift(task.label(), job, start_drift_us);
+
         // Start delay violation (> 500 µs threshold).
         if start_drift_us > 500 {
             let v = DeadlineViolation {
@@ -278,6 +286,7 @@ fn run_task(
                 detected_at: started_at,
             };
             log_violation(&v);
+            logger.log_sched_violation(task.label(), job, v.kind.label(), start_drift_us);
             vlog.lock().unwrap().push(v);
         }
 
@@ -313,14 +322,17 @@ fn run_task(
                 detected_at: finished_at,
             };
             log_violation(&v);
+            logger.log_sched_violation(task.label(), job, v.kind.label(), overrun_us);
             vlog.lock().unwrap().push(v);
         }
 
-        // Jitter calculation.
+        // Jitter calculation — log to file.
         let jitter_str = if let Some(prev) = last_finish {
-            let actual   = finished_at.duration_since(prev).as_micros() as f64;
-            let ideal    = period.as_micros() as f64;
-            format!("jitter={:.1}µs", (actual - ideal).abs())
+            let actual    = finished_at.duration_since(prev).as_micros() as f64;
+            let ideal     = period.as_micros() as f64;
+            let jitter_us = (actual - ideal).abs();
+            logger.log_sched_jitter(task.label(), job, exec_ns / 1_000, jitter_us);
+            format!("jitter={:.1}µs", jitter_us)
         } else {
             "jitter=N/A".to_string()
         };

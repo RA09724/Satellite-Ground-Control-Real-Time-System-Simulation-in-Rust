@@ -47,6 +47,7 @@ use tokio::sync::mpsc;
 use tokio::time as ttime;
 
 use crate::buffer::SensorBuffer;
+use crate::logger::Logger;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -116,16 +117,19 @@ pub struct DownlinkState {
     pub gcs_connected:   Arc<AtomicBool>,
     /// Queue latency samples (µs), collected for reporting.
     pub latency_log:     Arc<Mutex<Vec<u64>>>,
+    /// Logger handle for writing downlink latency to performance_log.txt.
+    pub logger:          Logger,
 }
 
 impl DownlinkState {
-    pub fn new() -> Self {
+    pub fn new(logger: Logger) -> Self {
         Self {
             packets_sent:  Arc::new(AtomicU64::new(0)),
             alerts_sent:   Arc::new(AtomicU64::new(0)),
             degraded_mode: Arc::new(AtomicBool::new(false)),
             gcs_connected: Arc::new(AtomicBool::new(false)),
             latency_log:   Arc::new(Mutex::new(Vec::new())),
+            logger,
         }
     }
 
@@ -154,9 +158,10 @@ pub fn spawn_downlink_task(
     buffer:       SensorBuffer,
     stop:         Arc<AtomicBool>,
     run_duration: Duration,
+    logger:       Logger,
 ) -> (thread::JoinHandle<()>, DownlinkState) {
 
-    let state = DownlinkState::new();
+    let state = DownlinkState::new(logger);
     let state_clone = state.clone();
 
     let handle = thread::spawn(move || {
@@ -427,6 +432,9 @@ async fn downlink_loop(
                 "[DOWNLINK][TX] seq={:>5} sensor={} cycle={:>5} latency={:.1}µs status={}",
                 seq, pkt.sensor, pkt.cycle, latency_us, status
             );
+
+            // Log buffer-to-uplink latency to performance_log.txt.
+            state.logger.log_downlink_latency(seq, &pkt.sensor, latency_us, status);
 
             let json = serde_json::to_string(&pkt).unwrap_or_default();
 
